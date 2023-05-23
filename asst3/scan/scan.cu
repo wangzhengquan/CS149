@@ -12,7 +12,7 @@
 
 #include "CycleTimer.h"
 
-#define THREADS_PER_BLOCK 256
+// #define THREADS_PER_BLOCK 256
 
 
 // helper function to round an integer up to the next power of 2
@@ -25,6 +25,30 @@ static inline int nextPow2(int n) {
     n |= n >> 16;
     n++;
     return n;
+}
+
+
+__global__
+void down_sweep(int * array, int offset) {
+    int thid = threadIdx.x + blockDim.x * blockIdx.x;
+    int ai = offset * (2 * thid + 1) - 1;
+    int bi = offset * (2 * thid + 2) - 1;
+    int t = array[ai];
+    array[ai] = array[bi];
+    array[bi] += t;
+}
+
+__global__ 
+void up_sweep(int * array, int offset) {
+    int thid = threadIdx.x + blockDim.x * blockIdx.x;
+    int ai = offset * (2 * thid + 1) - 1;
+    int bi = offset * (2 * thid + 2) - 1;
+    array[bi] += array[ai];
+}
+
+__global__ 
+void clear_last(int * array, int N) {
+    array[N - 1] = 0;
 }
 
 // exclusive_scan --
@@ -53,7 +77,39 @@ void exclusive_scan(int* input, int N, int* result)
     // on the CPU.  Your implementation will need to make multiple calls
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
+    const int THREADS_PER_BLOCK = 512;
 
+    // up sweep
+    int offset = 1;
+    int d = N / 2;
+    while (d > THREADS_PER_BLOCK) {
+        int blocks = d / THREADS_PER_BLOCK;
+        up_sweep<<<blocks, THREADS_PER_BLOCK>>>(result, offset);
+        offset *= 2;
+        d /= 2;
+    }
+    while (d > 0) {
+        up_sweep<<<1, d>>>(result, offset);
+        offset *= 2;
+        d /= 2;
+    }
+
+    // clear the last element
+    clear_last<<<1, 1>>>(result, N);
+
+    // down sweep
+    d = 1;
+    while (d <= THREADS_PER_BLOCK) {
+        offset /= 2;
+        down_sweep<<<1, d>>>(result, offset);
+        d *= 2;
+    }
+    while (d < N) {
+        offset /= 2;
+        int blocks = d / THREADS_PER_BLOCK;
+        down_sweep<<<blocks, THREADS_PER_BLOCK>>>(result, offset);
+        d *= 2;
+    }
 
 }
 
@@ -140,6 +196,31 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration; 
 }
 
+__global__
+void consecutive_cmp(int *input, int *output, int length) {
+    int thid = threadIdx.x + blockDim.x * blockIdx.x;
+    if (thid < length - 1) {
+        output[thid] = input[thid] == input[thid + 1] ? 1 : 0;
+    }
+}
+
+__global__
+void consecutive_sub(int *input, int *output, int length) {
+    int thid = threadIdx.x + blockDim.x * blockIdx.x;
+    if (thid < length - 1) {
+        output[thid] = input[thid + 1] - input[thid];
+    }
+}
+
+__global__
+void collect_repeats(int *prefix_sum, int *repeats_indicate, int *output, int length) {
+    int thid = threadIdx.x + blockDim.x * blockIdx.x;
+    if (thid < length - 1) {
+        if (repeats_indicate[thid] == 1) {
+            output[prefix_sum[thid]] = thid;
+        }
+    }
+}
 
 // find_repeats --
 //
@@ -161,7 +242,23 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
 
-    return 0; 
+    int THREADS_PER_BLOCK = 512;
+    int rounded_length = nextPow2(length);
+    if (length <= THREADS_PER_BLOCK) {
+        consecutive_cmp<<<1, length - 1>>>(device_input, temp, length);
+        exclusive_scan(temp, rounded_length, temp);
+        consecutive_sub<<<1, length - 1>>>(temp, device_input, length);
+        collect_repeats<<<1, length - 1>>>(temp, device_input, device_output, length);
+    } else {
+        int blocks = (length + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        consecutive_cmp<<<blocks, THREADS_PER_BLOCK>>>(device_input, temp, length);
+        exclusive_scan(temp, rounded_length, temp);
+        consecutive_sub<<<blocks, THREADS_PER_BLOCK>>>(temp, device_input, length);
+        collect_repeats<<<blocks, THREADS_PER_BLOCK>>>(temp, device_input, device_output, length);
+    }
+    int * repeats_num = new int;
+    cudaMemcpy(repeats_num, temp + length - 1, sizeof(int), cudaMemcpyDeviceToHost);    
+    return *repeats_num;  
 }
 
 
